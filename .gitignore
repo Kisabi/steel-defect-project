@@ -1,0 +1,10 @@
+data/raw/
+data/processed/
+*.pth
+*.ckpt
+mlruns/
+experiments/*/
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

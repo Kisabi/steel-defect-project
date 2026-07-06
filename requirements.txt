@@ -1,0 +1,10 @@
+torch
+torchvision
+segmentation-models-pytorch
+albumentations
+mlflow
+pytorch-fid
+streamlit
+pyyaml
+numpy
+opencv-python-headless

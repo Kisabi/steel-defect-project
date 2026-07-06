@@ -1,0 +1,15 @@
+services:
+  ml-dev:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    ipc: host
+    volumes:
+      - ../:/workspace
+    working_dir: /workspace
+    tty: true
