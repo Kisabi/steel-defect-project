@@ -1,10 +1,11 @@
-data/raw/
-data/processed/
+data/raw
+data/processed
 *.pth
 *.ckpt
 mlruns/
-experiments/*/
-.venv/
+mlflow.db
+experiments
+.venv
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
