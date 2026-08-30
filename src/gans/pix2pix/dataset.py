@@ -1,0 +1,156 @@
+"""
+Dataset for Pix2Pix: paired (multi-channel mask, real image) samples.
+
+Source masks are single-channel 'L' PNGs with pixel values 0-4
+(0 = background, 1-4 = defect class id), produced by
+scripts/preprocess_severstal.py. Where classes overlap in the source
+data, the higher class id wins (see preprocessing script docstring) -
+this dataset inherits that same simplification, so the GAN target is
+consistent with what the segmentation baseline was trained on.
+
+For Pix2Pix conditioning we expand the label map into a 4-channel
+binary one-hot tensor, one channel per defect class (1..4), matching
+the "multi-channel mask" conditioning strategy decided for this stage.
+
+class_3 oversampling: this dataset also exposes a helper to build a
+WeightedRandomSampler that boosts the sampling frequency of images
+containing class_3, calibrated to a target per-epoch fraction rather
+than a fixed multiplier - this keeps the oversampling strength an
+explicit, reportable knob for the thesis (useful for ablations).
+"""
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from PIL import Image
+from torch.utils.data import Dataset, WeightedRandomSampler
+
+IMG_HEIGHT = 256
+IMG_WIDTH = 1600
+NUM_CLASSES = 4
+CLASS_3_ID = 3
+
+
+class Pix2PixSteelDataset(Dataset):
+    """Paired (mask, image) dataset for Pix2Pix training.
+
+    Args:
+        split_csv: path to a splits/{train,val,test}.csv file
+            (columns: image_id, image_path, mask_path, has_defect).
+        images_root: root dir that image_path is relative to
+            (e.g. data/raw/severstal-steel-defect-detection).
+        masks_root: root dir that mask_path is relative to
+            (e.g. data/processed).
+        horizontal_flip_prob: probability of a joint horizontal flip
+            applied identically to image and mask. Set to 0 to disable.
+    """
+
+    def __init__(
+        self,
+        split_csv: str | Path,
+        images_root: str | Path,
+        masks_root: str | Path,
+        horizontal_flip_prob: float = 0.5,
+    ):
+        self.df = pd.read_csv(split_csv).reset_index(drop=True)
+        self.images_root = Path(images_root)
+        self.masks_root = Path(masks_root)
+        self.horizontal_flip_prob = horizontal_flip_prob
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def _load_mask_onehot(self, mask_path: Path) -> np.ndarray:
+        """Load a 0-4 label map PNG and expand it to a (H, W, 4) binary array."""
+        label_map = np.array(Image.open(mask_path))  # (H, W), values 0..4
+        channels = [(label_map == c).astype(np.float32) for c in range(1, NUM_CLASSES + 1)]
+        return np.stack(channels, axis=-1)  # (H, W, 4)
+
+    def __getitem__(self, idx: int) -> dict:
+        row = self.df.iloc[idx]
+
+        img_path = self.images_root / row["image_path"]
+        mask_path = self.masks_root / row["mask_path"]
+
+        image = np.array(Image.open(img_path).convert("RGB")).astype(np.float32)
+        mask = self._load_mask_onehot(mask_path)  # (H, W, 4)
+
+        if np.random.rand() < self.horizontal_flip_prob:
+            image = np.ascontiguousarray(image[:, ::-1, :])
+            mask = np.ascontiguousarray(mask[:, ::-1, :])
+
+        # image -> [-1, 1] for tanh generator output convention
+        image = (image / 127.5) - 1.0
+
+        image_t = torch.from_numpy(image).permute(2, 0, 1).float()  # (3, H, W)
+        mask_t = torch.from_numpy(mask).permute(2, 0, 1).float()  # (4, H, W)
+
+        return {
+            "mask": mask_t,
+            "image": image_t,
+            "image_id": row["image_id"],
+        }
+
+
+def get_class3_image_ids(raw_train_csv: str | Path) -> set[str]:
+    """Return the set of image_ids that contain at least one class_3 defect.
+
+    Reads the original Severstal train.csv (ImageId, ClassId, EncodedPixels)
+    directly, which is far cheaper than re-scanning every mask PNG.
+    """
+    df = pd.read_csv(raw_train_csv)
+    class3 = df[(df["ClassId"] == CLASS_3_ID) & df["EncodedPixels"].notna()]
+    return set(class3["ImageId"].unique())
+
+
+def build_class3_weighted_sampler(
+    dataset: Pix2PixSteelDataset,
+    class3_image_ids: set[str],
+    target_fraction: float = 0.25,
+) -> WeightedRandomSampler:
+    """Build a WeightedRandomSampler calibrated to a target class_3 fraction.
+
+    Rather than an arbitrary oversampling multiplier, this solves for the
+    per-sample weight w such that, in expectation, `target_fraction` of the
+    samples drawn per epoch contain class_3. Samples without class_3 keep
+    weight 1.0.
+
+    Args:
+        dataset: the Pix2PixSteelDataset (or a Subset of it) to sample from.
+        class3_image_ids: output of get_class3_image_ids().
+        target_fraction: desired expected fraction of class_3 samples per
+            epoch, e.g. 0.25 means ~1 in 4 samples will contain class_3.
+
+    Returns:
+        A WeightedRandomSampler with replacement=True and
+        num_samples=len(dataset), ready to pass to a DataLoader.
+    """
+    image_ids = dataset.df["image_id"].tolist()
+    is_class3 = np.array([img_id in class3_image_ids for img_id in image_ids])
+
+    n_total = len(is_class3)
+    n_class3 = int(is_class3.sum())
+    n_other = n_total - n_class3
+
+    if n_class3 == 0:
+        raise ValueError("No class_3 samples found in this split - check class3_image_ids.")
+    if not 0.0 < target_fraction < 1.0:
+        raise ValueError("target_fraction must be strictly between 0 and 1.")
+
+    # solve w * n3 / (w * n3 + n_other) = target_fraction  for w
+    w_class3 = (target_fraction * n_other) / (n_class3 * (1.0 - target_fraction))
+
+    weights = np.where(is_class3, w_class3, 1.0)
+
+    print(
+        f"[class3 sampler] n_total={n_total} n_class3={n_class3} ({n_class3 / n_total:.1%} natural) "
+        f"-> weight={w_class3:.2f} targeting {target_fraction:.0%} per epoch"
+    )
+
+    return WeightedRandomSampler(
+        weights=torch.from_numpy(weights).double(),
+        num_samples=n_total,
+        replacement=True,
+    )
