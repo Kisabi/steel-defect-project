@@ -122,18 +122,54 @@ separate GAN-targeted experiment for now.
 - Native resolution 1600x256, no crop/resize, to match the segmentation
   baseline's evaluation format.
 
+### Update: Pix2Pix pipeline complete, 25-epoch smoke test healthy
+
+`dataset.py` generalized to `get_class_image_ids()` /
+`build_class_weighted_sampler()` (configurable class_id, defaults to
+class_2). class_2 oversampling `target_fraction` set to 0.15 (not 0.25 -
+class_2 has only ~247 unique images dataset-wide / ~160 in train split;
+an aggressive target risked the GAN memorizing that small pool instead of
+generalizing, more of a concern for a generative model than it would be
+for segmentation-style class balancing).
+
+Implemented:
+- `generator.py` - U-Net, 6 downs (bottleneck 4x25 for native 1600x256
+  input), InstanceNorm (small batch size, 2-4, makes BatchNorm noisy),
+  Dropout(0.5) near the bottleneck for stochasticity. 29.24M params.
+- `discriminator.py` - standard 70x70 PatchGAN, 3 layers, conditioned on
+  concatenated (mask, image), 7 input channels. 2.77M params. Left at
+  standard depth - fully convolutional, doesn't need to match generator
+  depth.
+- `train.py` - adversarial (BCEWithLogits) + L1 (lambda=100), Adam
+  lr=2e-4 betas=(0.5, 0.999) for both G/D, separate AMP GradScalers,
+  MLflow logging, periodic visual sample grids (mask/fake/real).
+
+25-epoch run on the class_2-weighted train loader: `g_loss` 29.3->25.3,
+`l1` 27.1->22.6, both trending down smoothly; `d_loss` stable ~0.29-0.34
+(no sign of D overpowering G or vice versa). Visual samples show the
+generator starting to respond to mask shape - large blob-shaped defects
+(class_3/4-like) develop plausible speckled texture matching real images
+by epoch 20-25; thin line defects (1-2px wide) still barely visible,
+expected at this stage (less gradient signal per pixel early in
+training).
+
+**Known issue, not yet fixed:** visible checkerboard/grid artifact in the
+background texture across all samples - classic `ConvTranspose2d`
+(kernel=4, stride=2) artifact from uneven upsampling overlap. Standard
+fix is replacing `ConvTranspose2d` in the decoder with
+`nn.Upsample(mode="nearest") + Conv2d`. Not blocking further training,
+but should be addressed before FID comparison against SPADE/StyleGAN2-ADA
+- the artifact could distort FID scores independent of actual sample
+quality.
+
 ### Next steps
 
-1. Rename/generalize `get_class3_image_ids()` /
-   `build_class3_weighted_sampler()` in `dataset.py` to work off
-   `CLASS_ID` generically (or a class_2-specific version) - currently
-   still hardcoded to class_3.
-2. Re-run the sampler sanity check with class_2 and pick a sensible
-   `target_fraction` given its much lower natural frequency (3.7%).
-3. Implement Pix2Pix generator (`generator.py`) and discriminator
-   (`discriminator.py`).
-4. Implement training loop (`train.py`) with MLflow logging, following
-   the same conventions as `src/segmentation/train.py`.
-5. Later: SPADE, then StyleGAN2-ADA.
-6. Real:synthetic ratio experiments (75:25 / 50:50 / 25:75) evaluated via
+1. Full Pix2Pix training run (100+ epochs) - the 25-epoch smoke test
+   trend is healthy enough to proceed.
+2. Consider fixing the `ConvTranspose2d` checkerboard artifact before
+   final FID comparisons (see above).
+3. Implement FID computation script (needs InceptionV3, real vs.
+   generated sample sets).
+4. Move to SPADE, then StyleGAN2-ADA.
+5. Real:synthetic ratio experiments (75:25 / 50:50 / 25:75) evaluated via
    the corrected `evaluate.py` only.
