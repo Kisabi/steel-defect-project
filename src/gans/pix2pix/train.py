@@ -90,7 +90,7 @@ def train_one_epoch(
             pred_real = discriminator(real_pair)
             pred_fake = discriminator(fake_pair)
 
-            loss_d_real = adversarial_loss(pred_real, torch.ones_like(pred_real))
+            loss_d_real = adversarial_loss(pred_real, torch.full_like(pred_real, 0.9))
             loss_d_fake = adversarial_loss(pred_fake, torch.zeros_like(pred_fake))
             loss_d = 0.5 * (loss_d_real + loss_d_fake)
 

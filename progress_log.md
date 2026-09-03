@@ -173,3 +173,126 @@ quality.
 4. Move to SPADE, then StyleGAN2-ADA.
 5. Real:synthetic ratio experiments (75:25 / 50:50 / 25:75) evaluated via
    the corrected `evaluate.py` only.
+
+
+## Session: Checkerboard artifact fixes - three attempts, original architecture wins
+
+### Context
+
+Carried over from the previous session: the 25-epoch Pix2Pix smoke test
+(generator.py, U-Net, 6 downs, InstanceNorm, 29.24M params - see earlier
+entry "Update: Pix2Pix pipeline complete, 25-epoch smoke test healthy")
+had healthy loss dynamics but a visible checkerboard/grid artifact in the
+background texture, attributed to `ConvTranspose2d(kernel=4, stride=2)`
+uneven upsampling overlap. This session tried three fixes before running
+the full 100-epoch training, evaluated by short smoke tests (10-30
+epochs) and visual comparison of sample grids across epochs.
+
+---
+
+### Attempt 1: `Upsample(nearest) + Conv2d(kernel=3)`
+
+Replaced all three `ConvTranspose2d` upsampling layers (outermost,
+innermost, middle blocks) in `generator.py` with
+`nn.Upsample(scale_factor=2, mode="nearest")` followed by
+`nn.Conv2d(kernel_size=3, stride=1, padding=1)`.
+
+Result: checkerboard pattern eliminated, but generator params dropped
+29.24M -> 21.32M (smaller kernel = fewer weights per up-block). On a
+full 100-epoch run, output quality visibly *worsened* over training -
+background texture became increasingly blurry/blocky, with mosaic-like
+artifacts near defect regions by epoch 100. Quantitative losses looked
+healthy (`l1` dropped steadily to ~14.1, `d_loss` stable ~0.17-0.18) -
+the loss/visual-quality mismatch indicates the network was satisfying L1
+via blur/local averaging rather than learning real texture, likely due
+to reduced capacity from the smaller conv kernel.
+
+**Rejected.**
+
+### Attempt 2: `ConvTranspose2d(kernel=2, stride=2, padding=0)`
+
+Hypothesis: kernel=stride means no overlap between upsampling kernels,
+which is the textbook cause of checkerboard artifacts - should fix the
+artifact while staying closer to the original param count than Attempt 1.
+
+Wrong on the param count: kernel=2 means 4 weights per channel pair
+(2x2) vs. kernel=4's 16 weights per channel pair (4x4) - actually *more*
+aggressive parameter reduction than Attempt 1. Params dropped to 15.67M.
+
+**Rejected immediately without a training run**, given the capacity
+concern already observed in Attempt 1.
+
+### Attempt 3: ICNR initialization, original `ConvTranspose2d(kernel=4)` restored
+
+ICNR (Aitken et al., 2017): initializes ConvTranspose2d sub-kernels
+identically at the start of training (rather than independently at
+random), targeting the root cause of checkerboard artifacts without
+changing kernel size, stride, or param count (29.24M preserved).
+
+30-epoch smoke test: looked promising - `d_loss` stable ~0.27-0.37, no
+checkerboard visible, background texture sharp (not blurred like Attempt
+1).
+
+Full 100-epoch run told a different story. Sampled epochs 1/25/50/75/100:
+- Epoch 1: near-clean background.
+- Epoch 25: waffle/grid pattern clearly emerged.
+- Epochs 50-75: pattern held roughly steady.
+- Epoch 100: pattern intensified further, ending up *more* prominent
+  than the original un-fixed checkerboard from the first 25-epoch smoke
+  test.
+
+Conclusion: ICNR only fixes the *initialization* of ConvTranspose2d
+sub-kernels; nothing prevents them from diverging again during training
+via gradient updates. On a short run the fix looks like it's working; on
+the full 100-epoch run the pattern re-emerges and grows, making ICNR a
+delay rather than a solution - same failure mode observed with the
+original architecture's artifact in Attempt 1's rejected fix path, just
+on a longer timescale.
+
+**Rejected.**
+
+---
+
+### Final decision: revert to original architecture, accept the artifact
+
+`generator.py` reverted fully to `ConvTranspose2d(kernel=4, stride=2,
+padding=1)` in all three upsampling blocks, standard `normal_(0, 0.02)`
+init for all Conv/ConvTranspose/Norm layers (ICNR init and `icnr_init()`
+helper removed). 29.24M params confirmed.
+
+Full 100-epoch run on this architecture (epochs 1/25/50/75/100 sampled):
+mild checkerboard artifact present but stable, does not intensify over
+training the way ICNR's pattern did. Large blob-shaped defects develop
+plausible speckled texture by epoch 100, comparable to what was seen in
+the original 25-epoch smoke test. Result accepted as satisfactory for
+the thesis.
+
+**Accepted as final Pix2Pix generator architecture.** The checkerboard
+artifact is a known, documented limitation - to be discussed explicitly
+when comparing FID scores against SPADE/StyleGAN2-ADA, since it could
+inflate Pix2Pix's FID independent of actual sample quality. Worth a
+one-line caveat in the thesis discussion section.
+
+### Key learning
+
+For `ConvTranspose2d` checkerboard artifacts: capacity-preserving fixes
+(ICNR) only delay the artifact's emergence, they don't prevent it from
+re-emerging under longer training with a narrow, oversampled data pool
+(~160 class_2 images). Capacity-reducing fixes (`Upsample+Conv`,
+smaller-kernel `ConvTranspose2d`) trade the artifact for a different
+failure mode (blur/mosaic from insufficient decoder capacity). Given the
+project's remaining scope (SPADE, StyleGAN2-ADA, ratio experiments), the
+mild original artifact was judged the least-bad option - fixing it
+properly would likely require an architecture change beyond swapping the
+upsampling op (e.g. sub-pixel conv / PixelShuffle with its own dedicated
+capacity, not just an init trick on the existing layer).
+
+### Next steps (updated)
+
+1. FID evaluation comparing real vs. synthetic outputs (Pix2Pix baseline
+   ready - checkpoint from the accepted 100-epoch run).
+2. SPADE implementation, then StyleGAN2-ADA.
+3. Segmentation retraining experiments with varying real:synthetic
+   ratios (75:25, 50:50, 25:75), evaluated via corrected `evaluate.py`.
+4. Note the checkerboard artifact as a limitation in the FID discussion
+   when comparing Pix2Pix against SPADE/StyleGAN2-ADA.

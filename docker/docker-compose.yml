@@ -12,7 +12,11 @@ services:
     volumes:
       - ../:/workspace
       - /opt/steel-defect-data:/opt/steel-defect-data
+      - ~/.cache/huggingface:/root/.cache/huggingface
     working_dir: /workspace
     tty: true
+    ports:
+      - "8888:8888"
     environment:
       - MLFLOW_TRACKING_URI=sqlite:////opt/steel-defect-data/mlflow/mlflow.db
+      - PYTHONPATH=/workspace
