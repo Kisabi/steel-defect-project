@@ -9,3 +9,4 @@ pyyaml
 numpy
 opencv-python-headless
 scikit-learn
+jupyterlab
