@@ -296,3 +296,159 @@ capacity, not just an init trick on the existing layer).
    ratios (75:25, 50:50, 25:75), evaluated via corrected `evaluate.py`.
 4. Note the checkerboard artifact as a limitation in the FID discussion
    when comparing Pix2Pix against SPADE/StyleGAN2-ADA.
+
+
+### Backlog: MLflow reporting hygiene (not urgent, before thesis writing)
+
+Raised while building compute_fid.py. Deferred - applies to train.py and
+general MLflow usage, not FID specifically:
+
+- train.py's mlflow.start_run() has no run_name/tags - runs are only
+  identifiable by random hash in the UI. Same fix as compute_fid.py
+  (run_name, tags: stage/generator_variant/git_commit) should be ported
+  over, ideally before the SPADE/StyleGAN2-ADA runs start piling up
+  alongside Pix2Pix's.
+- No periodic backup of mlflow.db (SQLite, single file, single point of
+  failure). Worth a cron/manual weekly copy somewhere outside
+  /opt/steel-defect-data before results start feeding the thesis.
+- For the thesis results chapter: don't rely on MLflow UI screenshots -
+  export via mlflow.search_runs() to CSV/markdown as the actual source
+  for tables/figures (a snippet for this was sketched in a compute_fid.py
+  discussion, not yet written to a file - re-derive when needed).
+
+
+
+## Session: Pix2Pix FID evaluation
+
+### Context
+
+Implemented FID (Frechet Inception Distance) evaluation comparing real
+vs. Pix2Pix-generated steel defect images, using clean-fid's InceptionV3
+feature port (mode="clean", verified ROCm-compatible before implementation
+- feature shape (N, 2048) confirmed). Two scopes: "overall" (full test
+split) and "class_2" (test-split subset containing the oversampling
+target class, via the existing get_class_image_ids() helper).
+
+### Artifacts produced
+
+- `src/gans/pix2pix/compute_fid.py` - generates paired fake images from
+  test-split masks (generator kept in `.train()` mode so Dropout stays
+  active for stochastic sampling - `--samples-per-mask` controls how many
+  fake variants per real mask), extracts InceptionV3 features via
+  clean-fid, computes raw FID (`fid_from_feats`) and an attempted
+  bias-corrected FID (Chong & Forsyth, 2020 - extrapolation to N->infinity).
+  MLflow logging with `run_name`/tags (`stage`, `note`, `git_commit`,
+  `checkpoint`) for identifiable runs (git tag needs
+  `git config --global --add safe.directory /workspace` inside the
+  container - dubious-ownership issue, not a code bug).
+
+### Bugs found and fixed during implementation
+
+1. **cleanfid.fid.frechet_distance too slow for repeated calls.** The
+   bias-correction loop calls a Frechet-distance computation
+   n_sizes x n_repeats times per scope (160+ by default, 320+ across both
+   scopes) on the full 2048x2048 InceptionV3 covariance matrices.
+   scipy.linalg.sqrtm (general Schur-based, used internally by clean-fid)
+   pegged the CPU for a very long time at that call count. Fixed with a
+   custom `fast_frechet_distance()` using the identity
+   eig(A@B) == eig(A^0.5 @ B @ A^0.5) for symmetric PSD A, B - only needs
+   `eigh`/`eigvalsh` (fast, numerically stable for singular/rank-deficient
+   matrices, which our covariance matrices always are - see below), not
+   the general Schur method. Cut the bias-correction step from
+   "effectively hung" to ~20-45 seconds per scope. Only used inside the
+   bias-correction loop - the one-off raw FID computation still uses
+   clean-fid's own `fid_from_feats`/`frechet_distance`, since it's called
+   only once per scope and isn't the bottleneck.
+
+2. **Fake pool discarded during bias correction.** `generate_fakes()`
+   intentionally produces more fake images than real ones
+   (`--samples-per-mask > 1`, since Dropout-based stochastic generation is
+   cheap and real steel defect photos are the actual scarce resource -
+   e.g. overall scope: 1000 real vs 5000 fake). The first version of
+   `bias_corrected_fid()` subsampled *both* sides down to a shared
+   N = min(n_real, n_fake) at every grid point, discarding most of the
+   fake-side sample-size advantage that `raw_fid` (computed on the full
+   asymmetric 1000 vs 5000) actually benefits from. This produced
+   bias-corrected FID *higher* than raw FID for the overall scope (87-89
+   vs raw ~80) - the wrong direction, since more effective sample size
+   should only reduce estimated bias, never increase it. Fixed by holding
+   the fake side fixed at its full available pool (mu_f/sigma_f computed
+   once, reused across every real-subsample size/repeat) and only varying
+   n_real in the extrapolation grid - real images are the actual
+   scarcity bottleneck for this thesis, not synthetic ones.
+
+3. **Subsample-size grid spaced wrong for the regression.** The
+   extrapolation regresses FID(n) against 1/n, but the size grid was
+   generated with `np.linspace(min_size, max_size)` - i.e. evenly spaced
+   in n, not in 1/n. This concentrates almost the entire useful 1/n range
+   into a single small-n point with disproportionate leverage on the
+   fitted line, distorting the intercept. Fixed by spacing the grid evenly
+   in 1/n instead (`np.linspace(1/max_real, 1/min_size, num=n_sizes)`,
+   inverted back to integer sizes) - matches the actual Chong & Forsyth
+   methodology.
+
+### Finding: bias-corrected FID is unreliable at our sample sizes -
+### methodological limitation, not a further bug
+
+After fixing all three issues above, the diagnostic FID(n_real) curve is
+clean and monotonically decreasing (confirmed by printing every grid
+point + raw_fid for comparison - the largest-N point matches raw_fid
+almost exactly, as expected, since at n_real = full real count the
+subsample equals the full set and the fake side is already fixed at its
+full pool too). However, the *slope* between consecutive points is
+markedly non-constant and non-monotonic even after fixing the grid
+spacing (e.g. overall scope: pairwise slopes ~1233 -> 881 -> 834 -> 707
+-> 1676 -> 2134 -> 3781 across the 8-point grid) - i.e. FID(n_real) is not
+actually linear in 1/n_real over this range. Two different grid designs
+(evenly-spaced-in-n vs evenly-spaced-in-1/n) produced two different,
+non-converging bias-corrected estimates (83.9 vs 92.8 for the overall
+scope) rather than agreeing - if this were a grid-design artifact alone,
+both should converge toward the same extrapolated value.
+
+Likely cause: n_real never exceeds 1000 (overall) or 49 (class_2), both
+far below 2048 - the InceptionV3 feature dimensionality - so the
+2048x2048 covariance matrix is *always* rank-deficient (rank <= n-1)
+at every point on the grid, not just at the small-n end. The Chong &
+Forsyth linear-in-1/N bias model is empirically validated in regimes
+where N spans well above the feature dimensionality; it has no guarantee
+of holding when N stays below D for the entire tested range, which is
+our situation for both scopes.
+
+**Decision: raw FID is the metric reported for the thesis, not the
+bias-corrected extrapolation.** This matches standard practice in the
+GAN literature (raw FID is reported even at small N in most papers). The
+FID(n_real) curve is kept as a *descriptive* diagnostic (illustrates the
+direction/magnitude of small-sample inflation, especially stark for
+class_2: 183 at n=20 vs 170 at n=49) rather than a corrective one. To be
+stated explicitly in the thesis discussion/limitations section: N is
+always below the InceptionV3 feature dimensionality (2048) for both
+scopes, so Chong & Forsyth-style bias correction was attempted but found
+unreliable in this regime, rather than silently omitted.
+
+### Results (Pix2Pix baseline, 100-epoch accepted-architecture checkpoint)
+
+| scope | raw FID | n_real | n_fake |
+|---|---|---|---|
+| overall | 80.390 | 1000 | 5000 |
+| class_2 | 170.486 | 49 | 245 |
+
+class_2's much worse FID than overall is a substantive, expected result
+(mirrors the segmentation baseline's weak class_2 IoU) - consistent with
+the small training pool (~160 images) and the accepted checkerboard
+artifact, which likely distorts fine/thin-defect texture (class_2's
+typical presentation) more than large blob-shaped defects (class_3/4-
+like). Worth cross-referencing with the checkerboard-artifact discussion
+already in progress_log.md when writing the thesis discussion section.
+
+### Next steps
+
+1. SPADE implementation, then StyleGAN2-ADA - run the *same*
+   compute_fid.py (same test split, same --samples-per-mask) against each
+   for a like-for-like raw FID comparison across all three architectures.
+2. Segmentation ratio experiments (75:25 / 50:50 / 25:75), evaluated via
+   the corrected (sum-then-divide) evaluate.py only - unrelated to this
+   session's FID bias-correction findings, no changes needed there.
+3. When writing the thesis: explicitly document the N < 2048 limitation
+   for FID bias correction (see "Finding" above) alongside the checkerboard
+   artifact as a joint discussion of what could distort the Pix2Pix FID
+   numbers independent of actual sample quality.
