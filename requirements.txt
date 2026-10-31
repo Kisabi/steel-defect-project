@@ -2,7 +2,7 @@ torch
 torchvision
 segmentation-models-pytorch
 albumentations
-mlflow
+mlflow==3.16.1
 pytorch-fid
 streamlit
 pyyaml
@@ -10,3 +10,4 @@ numpy
 opencv-python-headless
 scikit-learn
 jupyterlab
+clean-fid
