@@ -452,3 +452,241 @@ already in progress_log.md when writing the thesis discussion section.
    for FID bias correction (see "Finding" above) alongside the checkerboard
    artifact as a joint discussion of what could distort the Pix2Pix FID
    numbers independent of actual sample quality.
+
+## Session: SPADE implementation, discriminator-balance tuning, full training, and FID evaluation
+
+### Context
+
+Following the architecture decisions made when starting this stage (reuse
+`src/gans/pix2pix/dataset.py`/`build_class_weighted_sampler()` unchanged,
+same train/val/test splits, same `compute_fid.py` pattern), implemented
+SPADE (Park et al., 2019) as the second of three GAN architectures for
+this thesis, deliberately staying close to the original paper and
+deviating only where forced (VRAM, network access, or an empirically
+diagnosed training-stability problem) - same philosophy used for Pix2Pix.
+
+### Architecture decisions
+
+- `spade_norm.py` - SPADE normalization (spatially-adaptive gamma/beta
+  predicted from the mask via two small conv branches), InstanceNorm2d
+  as the parameter-free base rather than the paper's default BatchNorm2d
+  - same VRAM/batch-size=2-4 rationale already established for Pix2Pix's
+    generator (the paper itself names this configuration, `spadeinstance3x3`,
+    so it's a supported variant, not an ad hoc change).
+- `spade_resblock.py` - SPADEResnetBlock, spectral norm on every conv
+  (paper default), weight init (`normal_(0, 0.02)`) applied *before*
+  wrapping in `torch.nn.utils.parametrizations.spectral_norm`, since that
+  API turns `.weight` into a computed parametrization - a later blanket
+  `model.apply(init_weights)` would silently miss the real underlying
+  weight.
+- `generator.py` - SPADEGenerator, "more"-upsampling-layer configuration
+  (6 `Upsample(nearest)` doublings, 7 SPADEResnetBlocks: head_0,
+  G_middle_0, G_middle_1, up_0..up_3), seed resolution 4x25 - chosen
+  specifically to match Pix2Pix's 6-downsampling-block bottleneck
+  (1600/64=25, 256/64=4 exactly), so the two generators share the same
+  effective receptive-field depth as a controlled variable. No VAE image
+  encoder; stochastic sampling instead comes from `Dropout2d(0.5)` in the
+  three bottleneck-adjacent blocks (head_0, G_middle_0, G_middle_1),
+  deliberately mirroring Pix2Pix's "dropout near the bottleneck, model
+  kept in `.train()` mode at inference" convention so `compute_fid.py`'s
+  `--samples-per-mask` stochastic-variant mechanism needed no SPADE-specific
+  handling.
+- `discriminator.py` - MultiscaleDiscriminator, num_D=2 (full resolution +
+  2x avgpool-downsampled), each scale a 4-layer PatchGAN with spectral
+  norm + InstanceNorm2d, returning intermediate activations for feature
+  matching. Same 7-channel (mask+image) conditioning as Pix2Pix's
+  discriminator, kept as a controlled variable.
+- `src/gans/common/losses.py` - hinge GAN loss (G and D), feature
+  matching loss (L1 across every discriminator scale/layer, paper's
+  `4/(n_layers_D+1)` per-layer weighting), VGG19 perceptual loss (5 tap
+  points at relu1_1..relu5_1, paper's `[1/32,1/16,1/8,1/4,1]` schedule).
+  VGG19 weights: `download.pytorch.org` isn't reachable from this
+  project's network setup, so the official torchvision ImageNet checkpoint
+  (`vgg19-dcbb9e9d.pth`) was downloaded manually (outside the container)
+  and loaded from `/opt/steel-defect-data/pretrained/vgg19-dcbb9e9d.pth` -
+  identical weights to what `torchvision.models.vgg19(pretrained=True)`
+  would have fetched, purely a network-access workaround, not an
+  architectural deviation.
+- Generator params at `ngf=32`: 29.41M (29,407,459 exactly, confirmed via
+  MLflow-logged `generator_params`) - deliberately chosen instead of the
+  paper's default `ngf=64` (92.09M) specifically to land within ~1M params
+  of Pix2Pix's generator (29.24M), keeping generator capacity a controlled
+  variable between the two architectures rather than an uncontrolled
+  side effect of a VRAM workaround. Discriminator: 5.54M params
+  (`ndf=64`, `n_layers_d=4`, `num_D=2`).
+
+### Finding 1: discriminator overpowering generator at baseline hyperparameters
+
+A 25-epoch smoke test at Pix2Pix-equivalent optimizer settings (Adam,
+lr=2e-4 for both G and D, betas=(0.5,0.999)) showed a clean, monotonic
+divergence with no reversal across all 5 sampled epochs:
+
+| epoch | g_loss | d_loss | vgg_loss |
+|---|---|---|---|
+| 5 | 16.4014 | 2.0256 | 0.5139 |
+| 25 | 19.0410 | 1.0038 | 0.5068 |
+
+`d_loss` fell monotonically, `g_loss` rose monotonically (hinge loss's
+`g_loss=-D(fake).mean()` has no upper saturation point, unlike BCE, so it
+grows without bound as D's margin widens), `vgg_loss` stayed flat - the
+discriminator steadily winning, unlike Pix2Pix's stable 25-epoch dynamics
+(`d_loss` ~0.29-0.34 throughout). Diagnosed as a real, non-catastrophic
+but self-reinforcing imbalance worth correcting before a full run.
+
+### Attempt 1: TTUR (asymmetric G/D learning rates) - insufficient alone
+
+`lr_g=4e-4`, `lr_d=1e-4` (D slowed relative to G - the standard first fix
+for this exact pattern). Result: barely moved the needle.
+
+| epoch | g_loss | d_loss | vgg_loss |
+|---|---|---|---|
+| 5 | 16.1512 | 2.1218 | 0.5082 |
+| 25 | 18.5782 | 1.0520 | 0.5002 |
+
+Same monotonic shape, nearly identical magnitudes to the baseline run.
+Honest negative result - kept the TTUR learning rates (no reason to
+revert) but moved to a second, independent lever.
+
+### Attempts 2-4: throttling discriminator update frequency - the effective lever
+
+Added `--d-update-every N` to `train.py`: D updates only every N steps
+(G still updates every step). Clean dose-response relationship across
+three escalations, each halving-or-more the previous divergence:
+
+| d_update_every | g_loss @5 | g_loss @25 | delta g_loss (5->25) | best vgg_loss seen |
+|---|---|---|---|---|
+| 1 (TTUR only) | 16.1512 | 18.5782 | +2.427 | ~0.500 |
+| 2 | 14.4846 | 16.1556 | +1.671 | ~0.489 (epoch 3-5) |
+| 4 | 13.8041 | 14.8649 | +1.061 | ~0.470 (epoch 13-15) |
+| 8 | 13.7406 | 13.8601 | **+0.120** | 0.4602 (epoch 20) |
+
+Both the divergence slope *and* the best achievable `vgg_loss` improved
+with every escalation - not just a flatter version of the same problem,
+genuinely better quality ceiling each time. At `d_update_every=8`,
+`epoch_fm_loss` and `epoch_vgg_loss` were nearly flat/slightly-improving
+for most of the 25 epochs, much closer to Pix2Pix's healthy dynamics;
+`epoch_adv_loss` (the purely adversarial component) still crept up
+~2x over the run, but is a small enough fraction of total `g_loss`
+(dominated by `10*fm_loss + 10*vgg_loss`) that it no longer visibly hurt
+perceptual quality within 25 epochs.
+
+**Decision: `d_update_every=8` for the full run.** The jump from
+`d_update_every=4` to `8` reduced the divergence by ~9x in one step -
+clear diminishing-returns territory, and pushing further risks starving
+D of a useful signal entirely (d_loss staying high/uninformative rather
+than providing real gradient). Not re-tested beyond 8 given thesis time
+budget; a reasonable stopping point given the dose-response curve shape.
+
+### Finding 2: mid-training instability in the full 100-epoch run (invisible in any 25-epoch smoke test)
+
+Full training run (`ngf=32`, `lr_g=4e-4`, `lr_d=1e-4`, `d_update_every=8`,
+`batch_size=2`, `checkpoint_every=5`, 100 epochs, ~1.1 days runtime,
+class_2 `target_fraction=0.15` unchanged from Pix2Pix) completed without
+crashing, but the MLflow curves showed something none of the five
+25-epoch smoke tests could have revealed, since they all stopped well
+before this point:
+
+- `epoch_d_loss` bottomed around epoch 65-70, then **reversed** and rose
+  back up to ~2.3 by epoch 100 (D "catching up" after the long
+  under-training imposed by `d_update_every=8`).
+- `epoch_vgg_loss` and `epoch_g_loss`, which had held a flat, healthy
+  plateau through epochs 20-80 (`vgg_loss` ~0.46-0.47), both spiked
+  sharply around epochs 85-90 (`vgg_loss` peaking ~0.555 - above even
+  the epoch-1 starting value) - a transient destabilization event,
+  coinciding with D's reversal.
+- Both recovered by epoch 100, but `vgg_loss` settled at ~0.48-0.49,
+  not fully back to the pre-spike plateau.
+
+Checkpoints were saved every 5 epochs specifically so this kind of
+late-training event wouldn't be invisible after the fact.
+
+### Finding 3: checkpoint selection by train-loss intuition was wrong - verified against FID instead
+
+Adapted `compute_fid.py` for SPADE (`src/gans/spade/compute_fid.py`):
+reused the Pix2Pix version's FID/bias-correction logic completely
+unchanged (same `fast_frechet_distance`, fixed-fake-pool and
+1/n-spaced-grid fixes - see earlier session). Two load-bearing changes
+only: (1) import `SPADEGenerator`/`build_generator` from
+`src.gans.spade.generator` instead of Pix2Pix's; (2) added a required
+`--ngf` flag (default 32) - `SPADEGenerator`'s own default is `ngf=64`,
+which does NOT match what every SPADE training run actually used, and
+silently building the wrong-capacity model would fail `load_state_dict`
+on a shape mismatch rather than loading something subtly wrong. Also
+made `--checkpoint` required (no default, unlike Pix2Pix's
+`generator_last.pth`) since there was no single "accepted" SPADE
+checkpoint yet going into this comparison.
+
+Given Finding 2, epoch 75 (right before the instability spike, closer to
+the train-loss plateau) was hypothesized as possibly a better checkpoint
+than epoch 100 (recovered, but not fully back to plateau). Ran
+`compute_fid.py` on both:
+
+| scope | epoch 75 (raw FID) | epoch 100 (raw FID) |
+|---|---|---|
+| overall (1000 real) | 97.702 | **68.125** |
+| class_2 (49 real) | 190.609 | **152.108** |
+
+**The train-loss-based hypothesis was wrong.** Epoch 100 is decisively
+better on both scopes despite its train `vgg_loss` sitting above the
+pre-spike plateau. Train-batch perceptual loss and held-out FID are
+correlated but not interchangeable for checkpoint selection - worth
+checking FID directly rather than inferring from training curves alone,
+whenever that's feasible. Bias-corrected FID was computed as a diagnostic
+alongside raw FID for both checkpoints but not trusted for the same
+reason already established for Pix2Pix (n_real stays below the 2048
+InceptionV3 feature dimensionality for both scopes; the class_2 scope's
+bias-corrected estimate landed on the opposite side of raw FID from the
+overall scope's, the same inconsistency signature that ruled out
+bias-correction for Pix2Pix).
+
+**Decision: epoch 100 (`generator_epoch0100.pth` / `generator_last.pth`)
+is the final SPADE checkpoint** for all further comparisons.
+
+### Result: SPADE (epoch 100) vs. Pix2Pix baseline, raw FID
+
+| scope | Pix2Pix | SPADE (epoch 100) |
+|---|---|---|
+| overall | 80.390 | **68.125** |
+| class_2 | 170.486 | **152.108** |
+
+SPADE outperforms Pix2Pix on raw FID at both scopes (~15% better overall,
+~11% better on class_2), despite the checkerboard-adjacent artifact
+swapping observed during earlier smoke tests (grid/mesh texture <->
+saturation blowout, never fully eliminated) and the epoch 80-90
+mid-training instability. Worth discussing explicitly in the thesis
+results chapter as a genuine architecture-level comparison point, not
+just "both models trained successfully."
+
+### Architecture decisions locked in for SPADE (deviations from Park et al., 2019)
+
+1. InstanceNorm2d (not BatchNorm2d) as SPADE's base normalization -
+   VRAM/batch-size=2-4 rationale, same as Pix2Pix; the paper's own
+   `spadeinstance3x3` naming supports this as a configured variant.
+2. `Dropout2d(0.5)` in the three bottleneck-adjacent SPADEResnetBlocks
+   instead of a VAE image encoder, for sample diversity - matches
+   Pix2Pix's existing stochasticity mechanism exactly, so `compute_fid.py`
+   needed no SPADE-specific handling for `--samples-per-mask`.
+3. `ngf=32` (not the paper's default 64) - deliberately matched to
+   Pix2Pix's generator param count (29.41M vs. 29.24M) as a controlled
+   variable between architectures, not merely a VRAM workaround.
+4. VGG19 perceptual-loss weights: official torchvision ImageNet checkpoint,
+   downloaded manually and loaded from a local path
+   (`/opt/steel-defect-data/pretrained/vgg19-dcbb9e9d.pth`) -
+   `download.pytorch.org` unreachable from this project's network setup;
+   same weights, not an architectural deviation.
+5. Asymmetric G/D learning rates (`lr_g=4e-4`, `lr_d=1e-4`) and D updated
+   only every 8 steps (`d_update_every=8`) - both needed to correct a
+   discriminator-overpowering-generator dynamic diagnosed via a 25-epoch
+   smoke test; TTUR alone was insufficient on its own, `d_update_every`
+   was the lever that actually worked (see dose-response table above).
+
+### Next steps
+
+1. StyleGAN2-ADA implementation next, reusing the same
+   `dataset.py`/`compute_fid.py` pattern established for Pix2Pix -> SPADE.
+2. Segmentation ratio experiments (75:25/50:50/25:75) once all three GANs
+   are trained and their checkpoints finalized, evaluated via the
+   corrected (sum-then-divide) `evaluate.py` only.
+3. Thesis discussion points to carry forward: SPADE's checkerboard-adjacent
+   artifact swap across training, the epoch 80-90 instability under
+   `d_update_every=8`, and SPADE's FID win over Pix2Pix despite both.
