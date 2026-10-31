@@ -690,3 +690,133 @@ just "both models trained successfully."
 3. Thesis discussion points to carry forward: SPADE's checkerboard-adjacent
    artifact swap across training, the epoch 80-90 instability under
    `d_update_every=8`, and SPADE's FID win over Pix2Pix despite both.
+
+
+
+
+## Session: StyleGAN2-ADA - own pure-PyTorch implementation, training in three parts, FID evaluation
+
+### Context
+
+Third GAN architecture of the thesis (after Pix2Pix and SPADE). The official
+StyleGAN2-ADA code was dropped (its reference-ops smoke test crashed the
+machine), so a mask-conditioned StyleGAN2 + ADA was written from scratch in
+pure PyTorch (no custom CUDA ops). Same dataset/splits, same class_2
+oversampling (target_fraction=0.15) and same compute_fid.py protocol as
+Pix2Pix/SPADE.
+
+### Architecture (src/gans/stylegan2_ada/)
+
+- layers.py - equalized-lr Linear/Conv2d, BiasLeakyReLU, Blur ([1,3,3,1],
+  stride 1/2), ModulatedConv2d (grouped-conv implementation), NoiseInjection.
+- generator.py - mapping network (4 layers, lr_mul 0.01); a conv MaskEncoder
+  (6 stride-2 convs) turns the 4-channel one-hot mask into the 4x25 seed map
+  instead of StyleGAN2's constant input; at every resolution the mask is
+  area-pooled and concatenated before each modulated conv; skip-architecture
+  ToRGB; 6 doublings 4x25 -> 256x1600. Upsampling is bilinear interpolation
+  before the modulated conv (not transposed conv + FIR) to avoid the
+  checkerboard artifact seen with Pix2Pix. channels=(512,512,512,512,352,160,64)
+  -> 29.31M params (Pix2Pix 29.24M, SPADE 29.41M: generator capacity kept as a
+  controlled variable). Diversity comes from z + per-pixel noise (no Dropout,
+  unlike Pix2Pix/SPADE).
+- discriminator.py - residual StyleGAN2 D on the 7-channel (mask+image) pair,
+  6 blur-downsampling blocks down to 4x25, minibatch std, 1x1 channel
+  reduction before the FC layer (keeps the FC small): 23.12M params (D size is
+  not a controlled variable; Pix2Pix D 2.77M, SPADE D 5.54M).
+- augment.py - own differentiable ADA applied to the (mask, image) pair: x/y
+  flip, integer and fractional translation, isotropic/anisotropic scale, tiny
+  rotation (rotate_max=0.01*pi), brightness, contrast (no rotate90, hue,
+  saturation; affine matrices built in an aspect-corrected space for 1600x256).
+  Controller: target r_t=0.6, interval 4, ada_kimg=100 (official 500 would be
+  too slow for ~175k total steps at batch 2).
+- train.py - non-saturating logistic loss; lazy R1 (gamma 10, every 16 D steps)
+  computed w.r.t. the already-augmented real image in fp32 (avoids a double
+  backward through grid_sample); fp16 autocast + GradScaler elsewhere; Adam
+  lr=0.002, betas=(0,0.99), D lr/betas scaled by 16/17; G EMA (ema_kimg =
+  10*batch/32, rampup 0.05) - the EMA generator is what gets saved and
+  evaluated; --resume with the full training state; MLflow run names/tags.
+  Not implemented: path length regularization, style mixing.
+- compute_fid.py - copy of the SPADE one (FID / bias-correction unchanged),
+  generator.eval(), --seed for the fake pool, EMA checkpoint as input.
+
+### Training
+
+Batch 2, 2333 steps/epoch, ~0.95 s/step with R1 (~0.51 s/step without R1, i.e.
+R1 is ~46% of the time), ~37 min/epoch, ~10.7 GB VRAM. Run in three parts of 25
+epochs (--resume from state_last.pth, identical arguments, state backed up
+before each part): epochs 1-25, 26-50, 51-75. Part 4 (76-100) was not run.
+
+### Issues met on the way
+
+- MIOpen prints GemmFwdRest / Im2d2Col warnings (compile errors for gfx1100 in
+  some runs); non-fatal, the R1 double backward ran in both fp32 and fp16.
+- One display blackout/freeze during a dry run with the desktop open (peak
+  ~11-12 GB of 16 GB VRAM, display on the same GPU); the same command ran fine
+  with other GPU apps closed -> most likely VRAM contention, not confirmed.
+  Keep other GPU-using apps closed during GAN runs.
+- Intermittent DataLoader start-up stall (main process waiting for the first
+  batch). Mitigation in the train loader: persistent_workers=True, timeout=300,
+  worker_init_fn with cv2.setNumThreads(0).
+- A 300-step dry run without R1 showed a one-step d_loss spike (~41); the R1
+  runs did not. R1 kept despite its cost.
+
+### Training dynamics
+
+- ADA p rose roughly linearly (0.12 at epoch 5, 0.37 at 25, 0.71 at 50) and hit
+  the cap 1.0 at ~epoch 74; epoch-mean r_t stayed 0.64-0.73, above the 0.6
+  target, so with this (milder than official) augmentation pipeline the
+  controller saturated.
+- g_loss ~2.0-2.4, d_loss 0.65-0.86 (D keeps a moderate, stable edge), r1
+  0.01-0.03, no divergence.
+- Samples: epoch 5 blurry blobs; epoch 15 plausible grainy texture; epoch 25+
+  sharp, vertical defects appear at mask positions (without any L1/VGG loss);
+  blocky patches around thin slanted lines (epochs 30-50) reduced by epoch 75.
+
+### FID (raw; overall = 1000 real / 5000 fake, class_2 = 49 real / 245 fake)
+
+| epoch | overall | class_2 |
+|---|---|---|
+| 25 | 58.001 | 131.970 |
+| 30 | 54.234 | 138.341 |
+| 35 | 52.807 | 135.688 |
+| 40 | 68.342 | 114.129 |
+| 45 | 49.741 | 112.627 |
+| 50 | **42.636** | 109.177 |
+| 55 | 44.925 | **107.070** |
+| 60 | 45.922 | 113.902 |
+| 65 | 53.232 | 116.980 |
+| 70 | 43.672 | 113.746 |
+| 75 | 45.662 | 116.129 |
+
+- Seed noise on a fixed checkpoint (epoch 50, seeds 0/1/2): overall 42.636 /
+  43.351 / 42.513 (std ~0.45), class_2 109.177 / 108.520 / 108.189 (std ~0.50).
+  Swings between neighbouring checkpoints (3-15 points) are therefore real
+  checkpoint differences, not sampling noise.
+- No improvement after epoch ~50; the plateau started before p reached 1.0.
+- Epoch 50 vs SPADE (epoch 100: 68.125 / 152.108): ~37% / 28% lower FID; vs
+  Pix2Pix (80.390 / 170.486): ~47% / 36% lower.
+- Bias-corrected FID again inconsistent with raw (n_real < 2048), not used.
+
+### Caveats for the thesis
+
+- Checkpoint selection by FID used the test split (as for SPADE's epoch choice;
+  Pix2Pix had no selection) -> slightly optimistic; StyleGAN2-ADA was selected
+  among 11 evaluated checkpoints.
+- StyleGAN2-ADA trained 75 epochs vs 100 for Pix2Pix/SPADE; best checkpoint at
+  epoch 50-55. Seed noise covers only the fake pool; training-run variance was
+  not measured (one run per model).
+- FID does not measure mask adherence, and this model has no L1/VGG loss: a
+  mask-consistency check is still to be done.
+
+### Next steps
+
+1. Decide to stop at epoch 75 (skip part 4).
+2. Mask-consistency script shared by all three GANs (baseline U-Net on
+   generated test images vs. the input masks; U-Net expects ImageNet-normalized
+   input while generators output [-1, 1]); use it to pick between epochs 50
+   and 55.
+3. Generate synthetic datasets for the three GANs and run the segmentation
+   ratio experiments (75:25 / 50:50 / 25:75), evaluated via the corrected
+   evaluate.py only.
+4. Optional: FID for epochs 5-20 (full curve); optionally select on the val
+   split instead of test.
