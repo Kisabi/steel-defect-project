@@ -820,3 +820,148 @@ before each part): epochs 1-25, 26-50, 51-75. Part 4 (76-100) was not run.
    evaluate.py only.
 4. Optional: FID for epochs 5-20 (full curve); optionally select on the val
    split instead of test.
+
+
+
+   ## Session: Mask-consistency evaluation of all three GANs (baseline U-Net as judge)
+
+### Context
+
+FID says nothing about whether a generated defect appears where the input mask
+asks for it. This stage measures mask adherence for Pix2Pix, SPADE and
+StyleGAN2-ADA with one shared script, and chooses the StyleGAN2-ADA checkpoint
+(epoch 50 vs 55). Final checkpoints used everywhere from here on:
+Pix2Pix `generator_last.pth` (epoch 100), SPADE `generator_epoch0100.pth`
+(`--ngf 32`), StyleGAN2-ADA `generator_epoch0055.pth` (EMA; chosen by the user
+after comparing epochs 50 and 55 on the val split).
+
+### Artifacts produced
+
+- `src/gans/common/mask_consistency.py` - one script, adapters for the three
+  generators (Pix2Pix/SPADE in `.train()` for Dropout, StyleGAN2-ADA in `.eval()`),
+  `--split val|test`, `--samples-per-mask 5`, `--seed 0`.
+- `src/gans/common/compare_mask_consistency.py` - paired bootstrap of two runs
+  (same split/seed/samples) from the saved per-mask `.npz` files.
+- Outputs (not in git): `experiments/mask_consistency/<model>/<ckpt>_<split>.json`
+  and `.npz` (per-mask arrays), example figures in `.../examples/`, real-ceiling
+  cache `experiments/mask_consistency/real_ceiling_*.npz`, MLflow experiment
+  `mask_consistency`.
+
+### Method (decisions)
+
+- Fakes: [-1,1] -> uint8 with truncating `.byte()` (same as compute_fid.py and
+  what ends up in PNGs) -> ImageNet mean/std -> frozen baseline U-Net. Reference =
+  the mask that generated the image.
+- Metric: dataset-level per-class IoU (sum confusion counts, then divide; same
+  convention as corrected evaluate.py). "Real ceiling" = same U-Net on the real
+  image of the same mask; it reproduces the baseline exactly (mIoU 0.6336;
+  0.4329 / 0.4888 / 0.6283 / 0.6454), which validates the pipeline. The meaningful
+  number is fake/real, not absolute fake IoU.
+- Uncertainty: 95% bootstrap CI over MASKS (all samples of a mask stay together).
+  Scopes: overall (1000 test masks) and class_2 subset (49 masks, wide CIs).
+- Diagnostics computed on the same generated images: image-level presence
+  recall/precision (>= 50 predicted px), brightness near/far from defects, colour
+  (chroma), local defect contrast |region - ring| with a NULL CONTROL (same
+  measure at shifted defect-free positions -> signal-to-null), and tolerant
+  recall/precision (class pixels with a same-class prediction within d px,
+  d = 0, 2, 5, 10, 25; plus "any_defect").
+- Results are reproducible: re-runs with seed 0 reproduced IoU to 3 decimals.
+
+### Results (test split, 1000 masks, 5 samples per mask, seed 0)
+
+Per-class IoU (fake), real ceiling for reference:
+
+| | bg | class_1 | class_2 | class_3 | class_4 | mIoU (5) | fake/real mIoU |
+|---|---|---|---|---|---|---|---|
+| real ceiling | 0.9724 | 0.4329 | 0.4888 | 0.6283 | 0.6454 | 0.6336 | 1 |
+| Pix2Pix | 0.9616 | 0.0551 | 0.0454 | 0.3911 | 0.3030 | 0.3513 | 0.554 |
+| SPADE (ep. 100) | 0.9686 | 0.0113 | 0.1151 | 0.6065 | 0.1495 | 0.3702 | 0.584 |
+| StyleGAN2-ADA (ep. 55) | 0.9658 | 0.0979 | 0.0389 | 0.3988 | 0.2240 | 0.3451 | 0.545 |
+
+Overall mIoU does not separate the models (CIs overlap); per-class results do.
+
+Tolerant recall at +-25 px (overall; real ceiling 0.72 / 0.89 / 0.93 / 0.92 / 0.93):
+
+| | class_1 | class_2 | class_3 | class_4 | any defect |
+|---|---|---|---|---|---|
+| Pix2Pix | 0.10 | 0.10 [0.04, 0.18] | 0.65 | 0.40 | 0.67 |
+| SPADE | 0.03 | 0.34 [0.23, 0.46] | 0.86 | 0.21 | 0.75 |
+| StyleGAN2-ADA | 0.17 | 0.09 [0.05, 0.15] | 0.68 | 0.31 | 0.71 |
+
+Where class_2 GT pixels go in the U-Net prediction (background / class_1 /
+class_2 / class_3): Pix2Pix 92% / 0 / 5% / 3%; SPADE 56% / 7% / 18% / 19%;
+StyleGAN2-ADA 61% / 0.5% / 4% / 34%.
+
+### Findings
+
+1. **No single winner; each model is best on a different class.** SPADE: class_2
+   and class_3 (its class_2 recall CI does not overlap the other two). Pix2Pix:
+   class_4. StyleGAN2-ADA: class_1. FID ranking (StyleGAN2-ADA < SPADE < Pix2Pix)
+   does not predict mask adherence: StyleGAN2-ADA has the best FID but is not
+   better than Pix2Pix on mask adherence. Direct material for the research
+   question "does FID correlate with downstream usefulness".
+2. **Boundary misalignment is not the main failure.** Tolerance barely helps
+   Pix2Pix/StyleGAN2-ADA on class_2 (0.05 -> 0.10, 0.04 -> 0.09) and does not help
+   any model on class_1/class_4. Only SPADE class_2 roughly doubles (0.18 -> 0.34).
+   Even "any defect" reaches only 0.67-0.75 of 0.93 (real) at +-25 px: in ~25-33%
+   of cases the U-Net sees no defect at all where the mask asks for one.
+3. **Misses, not hallucinations.** Pixel precision (d=0) of "any defect" is at
+   real level (0.77-0.84), i.e. when the U-Net finds a defect on a fake it is at the
+   masked place. Exception: class_2 precision is low (0.25-0.41 vs 0.64 real) -
+   all models trigger class_2 predictions where the mask did not ask for it.
+4. **SPADE artefacts (confirmed numerically).** "Spotlight": brightness far from
+   defects 0.77 of real overall (0.40 on class_2 masks), near defects 1.04. Colour
+   noise: ~5.6% of pixels with chroma > 8 (real: exactly R=G=B). Defect contrast
+   inflated and inverted: class_1 +25.8 vs real -0.9 gray levels (fake/real
+   |contrast| 4.5x for class_1, 2.07x for class_2); looks like the mask shape is
+   painted as a bright blob. Null control of SPADE is biased low (null positions
+   fall on its black background), so its signal-to-null (3.7x real) is inflated;
+   absolute contrast is the reliable number.
+5. **Colour is not the cause.** Converting SPADE fakes to gray changed mIoU
+   0.3702 -> 0.3682 (within CI) and left all other diagnostics unchanged.
+   Grayscale is still the right format for saved synthetic data (real images are
+   exactly gray) but it is not a fix.
+6. **Pix2Pix class_2: corrected hypothesis.** Absolute contrast is real-like
+   (fake/real 0.95) but the fake background is noisier (null 3.06 vs 0.84), so the
+   defect stands out 4x less than a real one (signal-to-null fake/real 0.26
+   [0.16, 0.43]). Partly confounded by brightness (fakes on class_2 masks are
+   brighter than the dark real images, real mean gray ~50 vs ~87 overall).
+   StyleGAN2-ADA's class_2 prominence is near real (0.80, CI includes 1) yet
+   recall is 0.09, so prominence alone does not predict detection (Pix2Pix has
+   the weakest class_4 prominence and the best class_4 recall).
+
+### Caveats for the thesis
+
+- The judge is a segmenter that is itself weak on class_1/class_2; it cannot
+  distinguish "generator ignored the mask" from "defect drawn but with an
+  appearance the U-Net does not recognise". Only fake/real ratios are meaningful.
+- class_2 scope has 49 masks: wide CIs; rows for classes with few masks in that
+  scope (class_1, class_3, class_4) are not interpretable.
+- Fakes on class_2 masks are brighter/darker than real images in model-specific
+  ways (the mask carries no global brightness information).
+- Checkpoint selection for StyleGAN2-ADA (50 vs 55) used the val split; FID
+  selection earlier used test (see previous sessions). One training run per model.
+- Pairs are per mask; the 5 samples of one mask are not independent (bootstrap is
+  over masks, so CIs account for it).
+
+### Decisions
+
+- StyleGAN2-ADA final checkpoint: epoch 55. Training stays stopped at epoch 75.
+- Synthetic data should be saved as gray (R=G=B) PNGs.
+- Because 25-33% of requested defects are not visible to the U-Net, plan an
+  ablation in the ratio experiments: unfiltered synthetic data vs data filtered by
+  U-Net agreement with the mask (per-image tolerant recall).
+
+### Next steps
+
+1. New chat: script to generate the synthetic datasets from the TRAIN masks (never
+   test - test is reserved for final evaluation), one folder per GAN, gray PNGs,
+   plus a CSV with a per-image agreement score (baseline U-Net, tolerant recall,
+   d = 10) to enable the filtered variant.
+2. Segmentation ratio experiments (75:25 / 50:50 / 25:75) for the three GANs, each
+   optionally filtered vs unfiltered, evaluated only with the corrected
+   `evaluate.py`; report class_2 and class_1 separately.
+3. Optionally: compare plain vs gray SPADE fakes with `compare_mask_consistency`
+   (paired); null-control caveat for SPADE should be stated in the discussion.
+4. Backlog unchanged: MLflow hygiene for `train.py`, periodic backup of
+   `mlflow.db`.
